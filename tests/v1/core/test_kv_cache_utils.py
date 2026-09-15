@@ -54,6 +54,7 @@ from vllm.v1.core.kv_cache_utils import (
     is_kv_cache_spec_uniform,
     make_block_hash_with_group_id,
     tensor_data,
+    warn_if_decode_exceeds_cudagraph_capture_size,
 )
 from vllm.v1.hisparse.layout import (
     create_hisparse_layout,
@@ -4250,3 +4251,109 @@ def test_deepseek_v4_annotation_requires_model_type():
     )
 
     assert not any(g.is_eagle_group for g in groups)
+
+
+@pytest.mark.parametrize(
+    "k,blocks,groups,seqs,budget,cap,expected",
+    [
+        (1, 5953, 5, 1024, 135680, 1024, (1082, 541, 11)),
+        (3, 5820, 5, 1024, 135680, 1024, (1108, 277, 21)),
+        (5, 5783, 5, 1024, 135680, 1024, (1116, 186, 31)),
+        (7, 5705, 5, 1024, 135680, 1024, (1112, 139, 41)),
+        (5, 5783, 5, 1024, 135680, 1200, None),
+        (5, 5783, 5, 1024, 135680, 1536, None),
+        (5, 5783, 5, 1024, 135680, 1116, None),
+        (5, 5783, 5, 100, 135680, 1024, None),
+        (5, 5783, 5, 1024, 1025, 1024, None),
+        (5, 5783, 5, 1024, 1108, 1024, (1104, 184, 31)),
+        (3, 1001, 2, 1024, 135680, 256, (444, 111, 9)),
+        (5, 31, 5, 1024, 135680, 1, None),
+        (0, 1025, 0, 1024, 135680, 512, (1024, 1024, 1)),
+    ],
+)
+def test_cache_resident_decode_graph_warning(
+    monkeypatch, k, blocks, groups, seqs, budget, cap, expected
+):
+    """Use the real cache pool, group count and scheduler limits in the warning."""
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=False),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=True, max_cudagraph_capture_size=cap
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=seqs, max_num_batched_tokens=budget
+        ),
+        uniform_decode_query_len=k + 1,
+    )
+    specs = [new_mamba_spec(num_speculative_blocks=k)] * groups
+    specs.append(
+        FullAttentionSpec(
+            block_size=4096, num_kv_heads=1, head_size=128, dtype=torch.float16
+        )
+    )
+    cache = KVCacheConfig(
+        num_blocks=blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec([str(i)], spec) for i, spec in enumerate(specs)
+        ],
+    )
+    calls = []
+    monkeypatch.setattr(
+        kv_cache_utils.logger, "warning_once", lambda *args: calls.append(args)
+    )
+    warn_if_decode_exceeds_cudagraph_capture_size(config, cache)
+    if expected is None:
+        assert not calls
+    else:
+        tokens, residents, per_request = expected
+        assert len(calls) == 1
+        message, *values = calls[0]
+        assert values == [tokens, residents, k + 1, blocks, per_request, cap]
+        assert "short, unshared" in message
+        assert "--max-cudagraph-capture-size" in message
+
+
+@pytest.mark.parametrize(
+    "skip",
+    [
+        "eager",
+        "disabled",
+        "zero_cap",
+        "empty",
+        "unsupported",
+        "checkpoints",
+        "all_mode",
+    ],
+)
+def test_decode_graph_warning_skips_inapplicable_estimates(monkeypatch, skip):
+    """Do not recommend graph changes for disabled graphs or unknown geometry."""
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=skip == "eager"),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=skip != "disabled",
+            max_cudagraph_capture_size=0 if skip == "zero_cap" else 1,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=1024, max_num_batched_tokens=8192
+        ),
+        uniform_decode_query_len=6,
+    )
+    spec = new_mamba_spec(num_speculative_blocks=5)
+    if skip == "checkpoints":
+        spec = replace(spec, num_prefill_checkpoint_blocks=1)
+    elif skip == "all_mode":
+        spec = replace(spec, mamba_cache_mode="all")
+    elif skip == "unsupported":
+        spec = new_sliding_window_spec()
+    cache = KVCacheConfig(
+        num_blocks=5783,
+        kv_cache_tensors=[],
+        kv_cache_groups=[] if skip == "empty" else [KVCacheGroupSpec(["m"], spec)],
+    )
+    calls = []
+    monkeypatch.setattr(
+        kv_cache_utils.logger, "warning_once", lambda *args: calls.append(args)
+    )
+    warn_if_decode_exceeds_cudagraph_capture_size(config, cache)
+    assert not calls
