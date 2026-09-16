@@ -53,6 +53,7 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
     resolve_kv_cache_block_sizes,
     update_kv_cache_capacity,
+    warn_if_decode_exceeds_cudagraph_capture_size,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -85,7 +86,7 @@ from vllm.v1.fault_tolerance.engine_core_sentinel import (
     EngineCoreSentinel,
     fault_tolerant_wrapper,
 )
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, is_full_attention_spec
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -168,6 +169,7 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
+        self._initialize_effective_attention_block_size()
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
@@ -355,6 +357,10 @@ class EngineCore:
         if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.model_executor.compile_or_warm_up_model()
 
+        warn_if_decode_exceeds_cudagraph_capture_size(
+            vllm_config, scheduler_kv_cache_config
+        )
+
         elapsed = time.time() - start
         compile_time = vllm_config.compilation_config.compilation_time
         encoder_compile_time = vllm_config.compilation_config.encoder_compilation_time
@@ -381,6 +387,21 @@ class EngineCore:
                 elapsed,
             )
         return scheduler_kv_cache_config
+
+    def _initialize_effective_attention_block_size(self) -> None:
+        cache_config = self.vllm_config.cache_config
+        cache_config.effective_attention_block_size = None
+        cache_manager = getattr(self.scheduler, "kv_cache_manager", None)
+        if cache_manager is None:
+            return
+        block_sizes = {
+            manager.block_size
+            for manager in cache_manager.coordinator.single_type_managers
+            if is_full_attention_spec(manager.kv_cache_spec)
+        }
+        cache_config.effective_attention_block_size = (
+            block_sizes.pop() if len(block_sizes) == 1 else None
+        )
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         supported_tasks = self.model_executor.supported_tasks
@@ -1649,6 +1670,9 @@ class EngineCoreProc(EngineCore):
             num_gpu_blocks=self.vllm_config.cache_config.num_gpu_blocks or 0,
             block_size=self.vllm_config.cache_config.block_size,
             mamba_block_size=self.vllm_config.cache_config.mamba_block_size,
+            effective_attention_block_size=(
+                self.vllm_config.cache_config.effective_attention_block_size
+            ),
             dp_stats_address=self.frontend_stats_publish_address,
             dtype=str(self.vllm_config.model_config.dtype).removeprefix("torch."),
             vllm_version=VLLM_VERSION,
@@ -2452,13 +2476,10 @@ class EngineCoreActorMixin:
     def _set_visible_devices(self, vllm_config: VllmConfig, local_dp_rank: int):
         from vllm.platforms import current_platform
 
-        if current_platform.is_xpu():
-            pass
-        else:
-            device_control_env_var = current_platform.device_control_env_var
-            self._set_assigned_physical_gpu_ids(
-                vllm_config, local_dp_rank, device_control_env_var
-            )
+        device_control_env_var = current_platform.device_control_env_var
+        self._set_assigned_physical_gpu_ids(
+            vllm_config, local_dp_rank, device_control_env_var
+        )
 
     def _set_assigned_physical_gpu_ids(
         self,
